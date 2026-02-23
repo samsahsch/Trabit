@@ -1,10 +1,3 @@
-//
-//  Extensions.swift
-//  Trabit
-//
-//  Created by samss on 1/28/26.
-//
-
 import SwiftUI
 import UIKit
 

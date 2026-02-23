@@ -20,20 +20,18 @@ struct CelebrationView: View {
                             HStack {
                                 VStack(alignment: .leading) {
                                     Text(log.date.formatted(date: .omitted, time: .shortened)).font(.caption).foregroundStyle(.secondary)
-                                    ForEach(log.entries, id: \.self) { entry in
-                                        HStack {
-                                            Text(entry.metricName)
-                                            Spacer()
-                                            // THE FIX: Uses the helper function to prevent compiler timeouts
-                                            Text(formattedValue(for: entry))
-                                        }
-                                    }
+                                    ForEach(log.entries, id: \.self) { entry in HStack { Text(entry.metricName); Spacer(); Text(formattedValue(for: entry)) } }
                                     if log.entries.isEmpty { Text("Completed") }
                                 }
                                 Spacer()
                                 Button {
                                     logBeingEdited = log
                                     for entry in log.entries { inputs[entry.metricName] = UnitHelpers.format(entry.value) }
+                                    if habit.name.lowercased() == "bedtime" {
+                                        let base = Calendar.current.startOfDay(for: selectedDate)
+                                        if let w = log.entries.first(where: { $0.metricName == "Wake Time" })?.value { wakeTime = base.addingTimeInterval(w * 3600) }
+                                        if let b = log.entries.first(where: { $0.metricName == "Bed Time" })?.value { sleepTime = base.addingTimeInterval(b * 3600) }
+                                    }
                                     isFocused = true
                                 } label: { Image(systemName: "pencil.circle.fill").font(.title2).foregroundStyle(.blue).padding(.leading, 8) }.buttonStyle(.plain)
                             }
@@ -61,7 +59,6 @@ struct CelebrationView: View {
         }
     }
     
-    // THE FIX: Safely retrieves the unit without crashing the SwiftUI ViewBuilder
     private func formattedValue(for entry: LogPoint) -> String {
         let unit = habit.definedMetrics.first(where: { $0.name == entry.metricName })?.unit ?? ""
         if unit.uppercased() == "AM" || unit.uppercased() == "PM" { return UnitHelpers.formatTime(entry.value) }
@@ -72,7 +69,6 @@ struct CelebrationView: View {
     func processSave() {
         let log = logBeingEdited ?? ActivityLog(date: selectedDate)
         log.entries.removeAll()
-        
         if habit.name.lowercased() == "bedtime" {
             var diff = wakeTime.timeIntervalSince(sleepTime) / 3600.0; if diff < 0 { diff += 24.0 }
             log.entries.append(LogPoint(metricName: "Duration", value: diff))
@@ -87,7 +83,6 @@ struct CelebrationView: View {
         var oldTotals: [String: Double] = [:]
         for m in habit.definedMetrics { oldTotals[m.name] = habit.logs.flatMap { $0.entries }.filter { $0.metricName == m.name }.reduce(0) { $0 + $1.value } }
         if logBeingEdited == nil { habit.logs.append(log) }
-        
         for g in habit.goals {
             if g.kind == .targetValue, let target = g.targetValue, let metric = g.metricName {
                 let isMax = metric.lowercased().contains("weight") || metric.lowercased().contains("mass")
@@ -97,7 +92,11 @@ struct CelebrationView: View {
                 for perc in [0.25, 0.50, 0.75, 1.0] {
                     if old < (target * perc) && new >= (target * perc) {
                         activeGoal = g; overlayMsg = perc == 1.0 ? "You reached your goal of \(UnitHelpers.format(target)) \(unit) for \(habit.name)!" : "You are \(Int(perc*100))% of the way there!"
-                        showOverlay = true; if perc == 1.0 { g.isCompleted = true; g.completionDate = Date() }
+                        showOverlay = true
+                        if perc == 1.0 {
+                            g.isCompleted = true; g.completionDate = Date()
+                            g.isArchived = true // Automatically tucks the goal into the archive
+                        }
                         return
                     }
                 }
@@ -135,10 +134,11 @@ struct CelebrationOverlay: View {
                 } else { Button("Close") { dismiss() }.foregroundStyle(.white).padding() }
                 
                 Button(action: {
-                    Task { @MainActor in
-                        var items: [Any] = [message.replacingOccurrences(of: "You", with: "I").replacingOccurrences(of: "your", with: "my"), URL(string: "https://trabit.app")!]
-                        if let img = generateSnapshot(), let data = img.pngData() { let tURL = FileManager.default.temporaryDirectory.appendingPathComponent("TShare.png"); try? data.write(to: tURL); items.append(tURL) }
-                        presentShareSheet(items: items)
+                    Task { @MainActor in var items: [Any] = [message.replacingOccurrences(of: "You", with: "I").replacingOccurrences(of: "your", with: "my"), URL(string: "https://trabit.app")!]; if let img = generateSnapshot(), let data = img.pngData() { let tURL = FileManager.default.temporaryDirectory.appendingPathComponent("TShare.png"); try? data.write(to: tURL); items.append(tURL) }
+                        let av = UIActivityViewController(activityItems: items, applicationActivities: nil)
+                        if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene, let root = scene.windows.first?.rootViewController {
+                            var top = root; while let p = top.presentedViewController { top = p }; top.present(av, animated: true)
+                        }
                     }
                 }) { Label("Share", systemImage: "square.and.arrow.up").padding().background(Material.regular).clipShape(Capsule()).foregroundStyle(.primary) }.padding(.bottom, 50)
             }

@@ -27,11 +27,21 @@ struct GoalsView: View {
                                 ForEach(archivedGoals, id: \.1.id) { (habit, goal) in GoalCard(habit: habit, goal: goal) }
                             }.padding(.top, 10)
                         } label: {
-                            Text("Archived Goals").font(.title2).bold().foregroundStyle(.primary) // Solid Black/White text
+                            Text("Archived Goals").font(.title2).bold().foregroundStyle(.primary)
                         }.padding().background(Color(uiColor: .secondarySystemGroupedBackground)).clipShape(RoundedRectangle(cornerRadius: 16))
                     }
                 }.padding(.vertical)
-            }.background(Color(uiColor: .systemGroupedBackground)).navigationTitle("Goals")
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .navigationTitle("Goals")
+            .toolbar {
+                // THE FIX: Uses native ShareLink to instantly export the CSV with zero crashes
+                ToolbarItem(placement: .topBarTrailing) {
+                    ShareLink(item: getCSVURL(habits: allHabits)) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                }
+            }
         }
     }
 }
@@ -52,16 +62,12 @@ struct GoalCard: View {
                 Text(goal.name ?? goal.kind.rawValue).font(.headline).bold()
                 Spacer()
                 if goal.isCompleted { Image(systemName: "checkmark.seal.fill").foregroundStyle(.yellow) }
-                Button(action: {
-                    Task { @MainActor in
-                        var items: [Any] = ["Tracking my goal on Trabit!", URL(string: "https://trabit.app")!]
-                        if let img = generateGoalSnapshot(), let data = img.pngData() {
-                            let tURL = FileManager.default.temporaryDirectory.appendingPathComponent("TrabitGoal.png")
-                            try? data.write(to: tURL); items.append(tURL)
-                        }
-                        presentShareSheet(items: items) // Uses safe global helper
+                Button(action: { Task { @MainActor in var items: [Any] = ["Tracking my goal on Trabit!", URL(string: "https://trabit.app")!]; if let img = generateGoalSnapshot(), let data = img.pngData() { let tURL = FileManager.default.temporaryDirectory.appendingPathComponent("TrabitGoal.png"); try? data.write(to: tURL); items.append(tURL) }
+                    let av = UIActivityViewController(activityItems: items, applicationActivities: nil)
+                    if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene, let root = scene.windows.first?.rootViewController {
+                        var top = root; while let p = top.presentedViewController { top = p }; top.present(av, animated: true)
                     }
-                }) { Image(systemName: "square.and.arrow.up").foregroundStyle(.blue) }
+                } }) { Image(systemName: "square.and.arrow.up").foregroundStyle(.blue) }
             }
             
             if goal.kind == .targetValue, let target = goal.targetValue, let metric = goal.metricName {
@@ -79,11 +85,15 @@ struct GoalCard: View {
                 HStack { Text("\(percentage)% Consistent").font(.subheadline).bold(); Spacer(); Text("\(diff.rawValue.capitalized)").font(.caption).padding(4).background(Color.secondary.opacity(0.2)).clipShape(Capsule()) }
             }
             
+            let hasActiveGoal = habit.goals.contains { !$0.isCompleted && !$0.isArchived }
             if goal.isArchived || goal.isCompleted {
                 HStack {
-                    if goal.isArchived { Button("Unarchive Goal") { goal.isArchived = false }.buttonStyle(.bordered) }
-                    Button("Archive Habit") { habit.isArchived = true }.buttonStyle(.bordered) // Hide the whole habit safely
-                    Button("Set New Goal") { showEditSheet = true }.buttonStyle(.borderedProminent)
+                    if !hasActiveGoal {
+                        Button("Set New Goal") {
+                            habit.isArchived = false // Unarchives habit instantly!
+                            showEditSheet = true
+                        }.buttonStyle(.borderedProminent)
+                    }
                 }.padding(.top, 5)
             }
         }
@@ -91,9 +101,5 @@ struct GoalCard: View {
         .sheet(isPresented: $showEditSheet) { AddEditHabitView(habitToEdit: habit) }
     }
     
-    private func calculateCurrentProgress(habit: Habit, metric: String) -> Double {
-        let entries = habit.logs.flatMap { $0.entries }.filter { $0.metricName == metric }
-        let isMax = metric.lowercased().contains("weight") || metric.lowercased().contains("mass")
-        return isMax ? (entries.map { $0.value }.max() ?? 0) : (entries.reduce(0) { $0 + $1.value })
-    }
+    private func calculateCurrentProgress(habit: Habit, metric: String) -> Double { let entries = habit.logs.flatMap { $0.entries }.filter { $0.metricName == metric }; let isMax = metric.lowercased().contains("weight") || metric.lowercased().contains("mass"); return isMax ? (entries.map { $0.value }.max() ?? 0) : (entries.reduce(0) { $0 + $1.value }) }
 }

@@ -18,46 +18,32 @@ enum ConsistencyDifficulty: String, Codable, CaseIterable {
 }
 
 struct UnitHelpers {
-    static let quickSuggestions: [String: [String]] = [
-        "Distance": ["km", "miles", "m", "laps"], "Time": ["min", "hours", "sec"],
-        "Weight": ["kg", "lbs"], "Volume": ["L", "ml"], "Count": ["reps", "times"], "Sleep": ["hours"]
+    static let synonyms: [String: [String]] = [
+        "running": ["ran", "run", "jog", "jogged"], "swimming": ["swam", "swim", "pool"],
+        "biking": ["bike", "biked", "cycled"], "water": ["drank", "drink"], "benchpress": ["bench", "lifted"]
     ]
-    
-    static let allIcons = [
-        "figure.run", "figure.walk", "figure.pool.swim", "bicycle", "dumbbell.fill", "figure.strengthtraining.traditional",
-        "flame.fill", "drop.fill", "book.fill", "bed.double.fill", "brain.head.profile", "sparkles",
-        "leaf.fill", "heart.fill", "star.fill", "moon.zzz.fill", "scalemass.fill", "chart.line.uptrend.xyaxis",
-        "cup.and.saucer.fill", "music.note", "fork.knife", "pawprint.fill", "sun.max.fill"
-    ]
+    static let quickSuggestions: [String: [String]] = ["Distance": ["km", "miles", "m", "laps"], "Time": ["min", "hours", "sec"], "Weight": ["kg", "lbs"], "Volume": ["L", "ml"], "Count": ["reps", "times"], "Sleep": ["hours"]]
+    static let allIcons = ["figure.run", "figure.walk", "figure.pool.swim", "bicycle", "dumbbell.fill", "figure.strengthtraining.traditional", "flame.fill", "drop.fill", "book.fill", "bed.double.fill", "brain.head.profile", "sparkles", "leaf.fill", "heart.fill", "star.fill", "moon.zzz.fill", "scalemass.fill", "chart.line.uptrend.xyaxis", "cup.and.saucer.fill", "music.note", "fork.knife", "pawprint.fill", "sun.max.fill"]
     static let allColors = ["007AFF", "FF3B30", "34C759", "FF9500", "AF52DE", "FF2D55", "5856D6", "5AC8FA", "4CD964", "FFCC00", "8E8E93", "2D3436"]
     
-    static func format(_ value: Double) -> String {
-        return value.truncatingRemainder(dividingBy: 1) == 0 ? String(format: "%.0f", value) : String(format: "%.1f", value)
-    }
+    static func format(_ value: Double) -> String { return value.truncatingRemainder(dividingBy: 1) == 0 ? String(format: "%.0f", value) : String(format: "%.1f", value) }
     
     static func formatTime(_ value: Double) -> String {
-        var val = value
-        while val < 0 { val += 24 }
-        while val >= 24 { val -= 24 }
-        let h = Int(val)
-        let m = Int(round((val - Double(h)) * 60))
-        let period = h >= 12 ? "PM" : "AM"
-        let displayH = h > 12 ? h - 12 : (h == 0 ? 12 : h)
+        var val = value; while val < 0 { val += 24 }; while val >= 24 { val -= 24 }
+        let h = Int(val); let m = Int(round((val - Double(h)) * 60))
+        let period = h >= 12 ? "PM" : "AM"; let displayH = h > 12 ? h - 12 : (h == 0 ? 12 : h)
         return String(format: "%d:%02d %@", displayH, m, period)
     }
-    
     static func formatDuration(_ value: Double) -> String {
         let h = Int(value); let m = Int(round((value - Double(h)) * 60))
-        if h == 0 { return "\(m)m" }
-        if m == 0 { return "\(h)h" }
-        return "\(h)h \(m)m"
+        if h == 0 { return "\(m)m" }; if m == 0 { return "\(h)h" }; return "\(h)h \(m)m"
     }
 }
 
 @Model final class Habit {
     var name: String; var iconSymbol: String; var hexColor: String; var createdDate: Date; var sortOrder: Int
     var frequencyType: FrequencyType; var frequencyInterval: Int?; var frequencyWeekdays: [Int]?
-    var isArchived: Bool = false
+    var isArchived: Bool = false; var dailyGoalCount: Int = 1
     
     @Relationship(deleteRule: .cascade) var definedMetrics: [MetricDefinition] = []
     @Relationship(deleteRule: .cascade) var logs: [ActivityLog] = []
@@ -78,7 +64,7 @@ struct UnitHelpers {
             let val = isMax ? (entries.map { $0.value }.max() ?? 0.0) : entries.reduce(0.0) { $0 + $1.value }
             return val >= threshold
         }
-        return true
+        return logsOnDate.count >= dailyGoalCount
     }
     
     func consistencyScore(for goal: GoalDefinition, upTo targetDate: Date = Date()) -> Int {
@@ -119,12 +105,17 @@ struct UnitHelpers {
     init(metricName: String, value: Double) { self.metricName = metricName; self.value = value }
 }
 
-// Global UI Helper to prevent Simulator UI sharing crashes
-func presentShareSheet(items: [Any]) {
-    guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-          let root = windowScene.windows.first?.rootViewController else { return }
-    var topController = root
-    while let presented = topController.presentedViewController { topController = presented }
-    let av = UIActivityViewController(activityItems: items, applicationActivities: nil)
-    topController.present(av, animated: true)
+// Generates CSV silently for the ShareLink
+func getCSVURL(habits: [Habit]) -> URL {
+    var csv = "Habit,Date,Metric,Value\n"
+    for h in habits {
+        for log in h.logs {
+            let d = log.date.formatted(date: .numeric, time: .omitted)
+            if log.entries.isEmpty { csv += "\(h.name),\(d),Completion,1\n" }
+            for e in log.entries { csv += "\(h.name),\(d),\(e.metricName),\(e.value)\n" }
+        }
+    }
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("TrabitData.csv")
+    try? csv.write(to: url, atomically: true, encoding: .utf8)
+    return url
 }
