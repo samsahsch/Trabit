@@ -44,6 +44,7 @@ struct UnitHelpers {
     var name: String; var iconSymbol: String; var hexColor: String; var createdDate: Date; var sortOrder: Int
     var frequencyType: FrequencyType; var frequencyInterval: Int?; var frequencyWeekdays: [Int]?
     var isArchived: Bool = false; var dailyGoalCount: Int = 1
+    var reminderEnabled: Bool = false; var reminderHour: Int = 9; var reminderMinute: Int = 0
     
     @Relationship(deleteRule: .cascade) var definedMetrics: [MetricDefinition] = []
     @Relationship(deleteRule: .cascade) var logs: [ActivityLog] = []

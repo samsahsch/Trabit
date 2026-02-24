@@ -21,12 +21,16 @@ struct AddEditHabitView: View {
     
     @State private var goals: [GoalDefinition] = []
     @State private var showGoalSheet = false
+    
+    @State private var reminderEnabled = false
+    @State private var reminderTime = Calendar.current.date(from: DateComponents(hour: 9, minute: 0)) ?? Date()
 
     var body: some View {
         NavigationStack {
             List {
                 IdentitySection(name: $name, selectedColor: $selectedColor, selectedIcon: $selectedIcon, freqType: $freqType, freqInterval: $freqInterval, freqDays: $freqDays, dailyGoalCount: $dailyGoalCount, metrics: $metrics)
                 MetricsSection(metrics: $metrics, tempMetricName: $tempMetricName, tempMetricUnit: $tempMetricUnit)
+                ReminderSection(reminderEnabled: $reminderEnabled, reminderTime: $reminderTime)
                 GoalsSection(goals: $goals, showGoalSheet: $showGoalSheet)
             }
             .listStyle(.insetGrouped)
@@ -37,9 +41,28 @@ struct AddEditHabitView: View {
         }
     }
     
-    func load(_ h: Habit) { name = h.name; selectedColor = h.hexColor; selectedIcon = h.iconSymbol; freqType = h.frequencyType; freqInterval = h.frequencyInterval ?? 2; freqDays = Set(h.frequencyWeekdays ?? [2,4,6]); dailyGoalCount = h.dailyGoalCount; metrics = h.definedMetrics; goals = h.goals }
+    func load(_ h: Habit) {
+        name = h.name; selectedColor = h.hexColor; selectedIcon = h.iconSymbol
+        freqType = h.frequencyType; freqInterval = h.frequencyInterval ?? 2
+        freqDays = Set(h.frequencyWeekdays ?? [2,4,6]); dailyGoalCount = h.dailyGoalCount
+        metrics = h.definedMetrics; goals = h.goals
+        reminderEnabled = h.reminderEnabled
+        reminderTime = Calendar.current.date(from: DateComponents(hour: h.reminderHour, minute: h.reminderMinute)) ?? Date()
+    }
     
-    func save() { let h = habitToEdit ?? Habit(name: name, icon: selectedIcon, color: selectedColor); h.name = name; h.hexColor = selectedColor; h.iconSymbol = selectedIcon; h.frequencyType = freqType; h.frequencyInterval = freqInterval; h.frequencyWeekdays = Array(freqDays); h.dailyGoalCount = dailyGoalCount; h.definedMetrics = metrics; h.goals = goals; if habitToEdit == nil { modelContext.insert(h) }; dismiss() }
+    func save() {
+        let h = habitToEdit ?? Habit(name: name, icon: selectedIcon, color: selectedColor)
+        h.name = name; h.hexColor = selectedColor; h.iconSymbol = selectedIcon
+        h.frequencyType = freqType; h.frequencyInterval = freqInterval
+        h.frequencyWeekdays = Array(freqDays); h.dailyGoalCount = dailyGoalCount
+        h.definedMetrics = metrics; h.goals = goals
+        h.reminderEnabled = reminderEnabled
+        h.reminderHour = Calendar.current.component(.hour, from: reminderTime)
+        h.reminderMinute = Calendar.current.component(.minute, from: reminderTime)
+        if habitToEdit == nil { modelContext.insert(h) }
+        NotificationManager.shared.scheduleReminder(for: h)
+        dismiss()
+    }
 }
 
 struct IdentitySection: View {
@@ -73,6 +96,20 @@ struct MetricsSection: View {
         Section("Metrics") {
             ForEach(metrics) { m in HStack { Text(m.name); Spacer(); Text(m.unit).font(.callout).padding(6).background(Color.secondary.opacity(0.1)).clipShape(RoundedRectangle(cornerRadius: 6)) }.swipeActions(edge: .trailing) { Button(role: .destructive) { if let idx = metrics.firstIndex(where: { $0 === m }) { metrics.remove(at: idx) } } label: { Label("Delete", systemImage: "trash") } } }
             VStack(alignment: .leading) { HStack { TextField("Name", text: $tempMetricName); TextField("Unit", text: $tempMetricUnit).frame(width: 60); Button("Add") { guard !tempMetricName.isEmpty, !tempMetricUnit.isEmpty else { return }; metrics.append(MetricDefinition(name: tempMetricName, unit: tempMetricUnit)); tempMetricName = ""; tempMetricUnit = "" }.buttonStyle(.bordered) }; if let suggestions = UnitHelpers.quickSuggestions[tempMetricName.capitalized] { HStack { Text("Quick Unit:").font(.caption).foregroundStyle(.secondary); ForEach(suggestions, id: \.self) { sug in Button(sug) { tempMetricUnit = sug }.font(.caption).buttonStyle(.bordered) } } } }
+        }
+    }
+}
+
+struct ReminderSection: View {
+    @Binding var reminderEnabled: Bool
+    @Binding var reminderTime: Date
+    
+    var body: some View {
+        Section("Reminder") {
+            Toggle("Daily Reminder", isOn: $reminderEnabled)
+            if reminderEnabled {
+                DatePicker("Remind at", selection: $reminderTime, displayedComponents: .hourAndMinute)
+            }
         }
     }
 }

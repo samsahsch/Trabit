@@ -1,22 +1,31 @@
 import SwiftUI
 import SwiftData
-import Combine
+import FoundationModels
 
 struct TodayView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \Habit.sortOrder) private var allHabits: [Habit]
     var habits: [Habit] { allHabits.filter { !$0.isArchived } }
     
-    @State private var showingAddSheet = false; @State private var habitToEdit: Habit?; @State private var selectedHabitForLog: Habit?
-    @State private var smartInputText = ""; @State private var selectedDate = Date()
+    @State private var showingAddSheet = false
+    @State private var habitToEdit: Habit?
+    @State private var selectedHabitForLog: Habit?
+    @State private var smartInputText = ""
+    @State private var selectedDate = Date()
     @State private var toastMessage: String?
+    @State private var isProcessingAI = false
     
-    let placeholders = ["Hold Siri button to log...", "20 pushups", "4km run", "Bedtime"]
-    @State private var phIndex = 0; let timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
+    private var model = SystemLanguageModel.default
+    private let aiLogger = AILoggerService()
+    
+    let placeholders = ["Try: '20 pushups'", "Try: '4km run'", "Try: 'drank 3L water'", "Try: 'floss'"]
+    @State private var phIndex = 0
+    @State private var phTimer: Timer?
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                // Date navigation
                 HStack {
                     Button { moveDate(by: -1) } label: { Image(systemName: "chevron.left.circle.fill").font(.title2) }
                     Spacer()
@@ -25,20 +34,37 @@ struct TodayView: View {
                     Button { moveDate(by: 1) } label: { Image(systemName: "chevron.right.circle.fill").font(.title2) }.disabled(Calendar.current.isDateInToday(selectedDate))
                 }.padding().background(Color(uiColor: .systemBackground))
                 
+                // AI Logger input bar
                 VStack(spacing: 0) {
                     HStack {
-                        Image(systemName: "apple.intelligence").foregroundStyle(.purple)
+                        if model.availability == .available {
+                            Image(systemName: "apple.intelligence").foregroundStyle(.purple)
+                        } else {
+                            Image(systemName: "text.magnifyingglass").foregroundStyle(.secondary)
+                        }
                         TextField(placeholders[phIndex], text: $smartInputText)
                             .onSubmit { processSmartLog() }
-                            .onReceive(timer) { _ in if smartInputText.isEmpty { withAnimation { phIndex = (phIndex + 1) % placeholders.count } } }
+                            .disabled(isProcessingAI)
+                        if isProcessingAI {
+                            ProgressView().controlSize(.small)
+                        }
                     }.padding()
                     
                     if let toast = toastMessage {
-                        Text(toast).font(.caption).foregroundStyle(.white).padding(6).background(toast.contains("✅") ? Color.green : Color.red).clipShape(Capsule()).padding(.bottom, 8)
-                            .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 3) { withAnimation { toastMessage = nil } } }
+                        Text(toast)
+                            .font(.caption).foregroundStyle(.white).padding(6)
+                            .background(toast.contains("Logged") ? Color.green : (toast.contains("Opened") ? Color.blue : Color.red))
+                            .clipShape(Capsule()).padding(.bottom, 8)
+                            .onAppear {
+                                Task { @MainActor in
+                                    try? await Task.sleep(for: .seconds(3))
+                                    withAnimation { toastMessage = nil }
+                                }
+                            }
                     }
                 }.background(Color(uiColor: .secondarySystemBackground))
                 
+                // Habit list
                 List {
                     ForEach(habits) { habit in
                         Button(action: { handleTap(for: habit) }) {
@@ -60,45 +86,147 @@ struct TodayView: View {
             }
             .navigationTitle("Dashboard").navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Menu("Demo") { Button("Load Demo") { DemoData.inject(context: modelContext) }; Button("Reset All", role: .destructive) { DemoData.clear(context: modelContext) } } }
+                ToolbarItem(placement: .topBarLeading) {
+                    Menu {
+                        Button("Load Demo") { DemoData.inject(context: modelContext) }
+                        Button("Reset All", role: .destructive) { DemoData.clear(context: modelContext) }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
                 ToolbarItem(placement: .primaryAction) { Button(action: { showingAddSheet = true }) { Image(systemName: "plus") } }
             }
             .sheet(isPresented: $showingAddSheet) { AddEditHabitView() }
             .sheet(item: $habitToEdit) { habit in AddEditHabitView(habitToEdit: habit) }
             .sheet(item: $selectedHabitForLog) { habit in CelebrationView(habit: habit, selectedDate: selectedDate).presentationDetents([.height(500), .large]) }
+            .onAppear { startPlaceholderRotation() }
+            .onDisappear { phTimer?.invalidate() }
         }
     }
     
-    var dateLabel: String { Calendar.current.isDateInToday(selectedDate) ? "Today" : (Calendar.current.isDateInYesterday(selectedDate) ? "Yesterday" : selectedDate.formatted(date: .abbreviated, time: .omitted)) }
-    func moveDate(by days: Int) { if let d = Calendar.current.date(byAdding: .day, value: days, to: selectedDate) { withAnimation { selectedDate = d } } }
-    func handleTap(for habit: Habit) { if habit.definedMetrics.isEmpty { withAnimation { habit.logs.append(ActivityLog(date: selectedDate)) } } else { selectedHabitForLog = habit } }
+    // MARK: - Helpers
     
-    func processSmartLog() {
-        let input = smartInputText.lowercased()
-        var matchedHabit: Habit? = nil
-        for habit in habits {
-            let hName = habit.name.lowercased()
-            if input.contains(hName) || input.contains(String(hName.prefix(4))) { matchedHabit = habit; break }
-            if let syns = UnitHelpers.synonyms[hName] { for syn in syns { if input.contains(syn) { matchedHabit = habit; break } } }
-            if matchedHabit != nil { break }
+    var dateLabel: String {
+        Calendar.current.isDateInToday(selectedDate) ? "Today" :
+        (Calendar.current.isDateInYesterday(selectedDate) ? "Yesterday" :
+            selectedDate.formatted(date: .abbreviated, time: .omitted))
+    }
+    
+    func moveDate(by days: Int) {
+        if let d = Calendar.current.date(byAdding: .day, value: days, to: selectedDate) {
+            withAnimation { selectedDate = d }
         }
-        guard let h = matchedHabit else { toastMessage = "❌ Couldn't find habit. Tap a row to log."; smartInputText = ""; return }
-        
-        let log = ActivityLog(date: selectedDate); var found = false; var loggedData = ""
-        for m in h.definedMetrics {
-            let pattern = "([0-9]*\\.?[0-9]+)\\s*\(m.unit.lowercased())"
-            let loosePattern = "([0-9]*\\.?[0-9]+)\\s*\(m.name.lowercased())"
-            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive), let match = regex.firstMatch(in: input, range: NSRange(location: 0, length: input.utf16.count)) {
-                if let val = Double((input as NSString).substring(with: match.range(at: 1))) { log.entries.append(LogPoint(metricName: m.name, value: val)); loggedData += "\(UnitHelpers.format(val))\(m.unit) "; found = true }
-            } else if let regex = try? NSRegularExpression(pattern: loosePattern, options: .caseInsensitive), let match = regex.firstMatch(in: input, range: NSRange(location: 0, length: input.utf16.count)) {
-                if let val = Double((input as NSString).substring(with: match.range(at: 1))) { log.entries.append(LogPoint(metricName: m.name, value: val)); loggedData += "\(UnitHelpers.format(val))\(m.unit) "; found = true }
+    }
+    
+    func handleTap(for habit: Habit) {
+        if habit.definedMetrics.isEmpty {
+            withAnimation { habit.logs.append(ActivityLog(date: selectedDate)) }
+        } else {
+            selectedHabitForLog = habit
+        }
+    }
+    
+    func startPlaceholderRotation() {
+        phTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
+            if smartInputText.isEmpty {
+                withAnimation { phIndex = (phIndex + 1) % placeholders.count }
             }
         }
-        if found || h.definedMetrics.isEmpty { h.logs.append(log); toastMessage = "✅ Logged \(h.name): \(loggedData)" }
-        else { toastMessage = "📝 Opened \(h.name) to log manually."; selectedHabitForLog = h }
+    }
+    
+    func moveHabits(from source: IndexSet, to destination: Int) {
+        var s = allHabits
+        s.move(fromOffsets: source, toOffset: destination)
+        for (i, h) in s.enumerated() { h.sortOrder = i }
+    }
+    
+    // MARK: - Smart Log Processing
+    
+    func processSmartLog() {
+        let input = smartInputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty else { return }
+        
+        if model.availability == .available {
+            processWithAI(input)
+        } else {
+            processWithRegex(input)
+        }
+    }
+    
+    /// AI-powered logging using FoundationModels
+    func processWithAI(_ input: String) {
+        isProcessingAI = true
+        smartInputText = ""
+        
+        Task {
+            do {
+                let parsed = try await aiLogger.parseInput(input, habits: habits)
+                
+                guard let habit = habits.first(where: { $0.name.lowercased() == parsed.habitName.lowercased() }) else {
+                    toastMessage = "Could not find habit '\(parsed.habitName)'"
+                    isProcessingAI = false
+                    return
+                }
+                
+                let log = ActivityLog(date: selectedDate)
+                var loggedData = ""
+                
+                if let value = parsed.value {
+                    // Try to match the AI-returned unit to a defined metric
+                    if let matchedMetric = habit.definedMetrics.first(where: {
+                        $0.unit.lowercased() == (parsed.unit ?? "").lowercased() ||
+                        $0.name.lowercased() == (parsed.unit ?? "").lowercased()
+                    }) {
+                        log.entries.append(LogPoint(metricName: matchedMetric.name, value: value))
+                        loggedData = "\(UnitHelpers.format(value)) \(matchedMetric.unit)"
+                    } else if let firstMetric = habit.definedMetrics.first {
+                        // Default to primary metric
+                        log.entries.append(LogPoint(metricName: firstMetric.name, value: value))
+                        loggedData = "\(UnitHelpers.format(value)) \(firstMetric.unit)"
+                    }
+                }
+                
+                if !log.entries.isEmpty || habit.definedMetrics.isEmpty {
+                    habit.logs.append(log)
+                    toastMessage = "Logged \(habit.name) \(loggedData)"
+                } else {
+                    toastMessage = "Opened \(habit.name) to log manually."
+                    selectedHabitForLog = habit
+                }
+            } catch {
+                // Fall back to regex on AI failure
+                processWithRegex(input)
+            }
+            isProcessingAI = false
+        }
+    }
+    
+    /// Regex fallback for devices without Apple Intelligence
+    func processWithRegex(_ input: String) {
+        guard let result = RegexLogParser.parse(input, habits: habits) else {
+            toastMessage = "Could not find a matching habit"
+            smartInputText = ""
+            return
+        }
+        
+        let log = ActivityLog(date: selectedDate)
+        var loggedData = ""
+        
+        for (metricName, value) in result.entries {
+            log.entries.append(LogPoint(metricName: metricName, value: value))
+            let unit = result.habit.definedMetrics.first(where: { $0.name == metricName })?.unit ?? ""
+            loggedData += "\(UnitHelpers.format(value))\(unit) "
+        }
+        
+        if !result.entries.isEmpty || result.habit.definedMetrics.isEmpty {
+            result.habit.logs.append(log)
+            toastMessage = "Logged \(result.habit.name) \(loggedData)"
+        } else {
+            toastMessage = "Opened \(result.habit.name) to log manually."
+            selectedHabitForLog = result.habit
+        }
         smartInputText = ""
     }
-    func moveHabits(from source: IndexSet, to destination: Int) { var s = allHabits; s.move(fromOffsets: source, toOffset: destination); for (i, h) in s.enumerated() { h.sortOrder = i } }
 }
 
 struct HabitRow: View {

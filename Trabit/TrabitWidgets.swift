@@ -1,6 +1,7 @@
 import WidgetKit
 import SwiftUI
 import SwiftData
+import AppIntents
 
 // MARK: - Widget Timeline Provider
 

@@ -5,20 +5,23 @@ import SwiftData
 struct TrackerAppApp: App {
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
-            Habit.self, // We tell the app to manage 'Habit' data
+            Habit.self,
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
         do {
             return try ModelContainer(for: schema, configurations: [modelConfiguration])
         } catch {
-            fatalError("Could not create ModelContai xner: \(error)")
+            fatalError("Could not create ModelContainer: \(error)")
         }
     }()
+
+    @State private var healthKitManager = HealthKitManager.shared
 
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environment(healthKitManager)
         }
         .modelContainer(sharedModelContainer)
     }
