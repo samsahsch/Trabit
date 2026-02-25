@@ -4,53 +4,38 @@ import SwiftData
 
 // MARK: - Generable Types for Structured AI Output
 
-@Generable(description: "A parsed habit log entry extracted from natural language input")
-struct ParsedHabitLog {
-    @Guide(description: "The exact name of the matched habit")
-    var habitName: String
-
-    @Guide(description: "The numeric value logged, e.g. 20 for '20 pushups'")
-    var value: Double?
-
-    @Guide(description: "The unit of measurement, e.g. reps, km, min, L")
-    var unit: String?
+/// A single metric value extracted from user input
+@Generable(description: "A single metric value extracted from the user's input")
+struct ParsedMetricEntry {
+    @Guide(description: "The numeric value, e.g. 5 or 30")
+    var value: Double
+    @Guide(description: "The unit, e.g. km, min, reps, L, hours")
+    var unit: String
 }
 
-// MARK: - Tool for Habit Lookup
+@Generable(description: "A parsed habit log entry extracted from natural language input")
+struct ParsedHabitLog {
+    @Guide(description: "The exact name of the matched habit from the habits list")
+    var habitName: String
 
-struct LookupHabitsTool: Tool {
-    let name = "lookupHabits"
-    let description = "Returns the list of habit names and their metrics that exist in the user's app"
-
-    @Generable
-    struct Arguments {
-        @Guide(description: "Search term from user input")
-        var searchTerm: String
-    }
-
-    var habitSummaries: [String]
-
-    func call(arguments: Arguments) async throws -> String {
-        return habitSummaries.joined(separator: "\n")
-    }
+    @Guide(description: "All numeric values and their units extracted from the input. For example '5km 30min run' returns [{value:5,unit:'km'},{value:30,unit:'min'}]. Empty array if habit has no metrics.")
+    var entries: [ParsedMetricEntry]
 }
 
 // MARK: - AI Logger Service
 
 @MainActor
 final class AILoggerService {
-    private var session: LanguageModelSession?
+    // Cache session per unique habit-list fingerprint to avoid re-initialisation cost
+    private var cachedSession: LanguageModelSession?
+    private var cachedHabitFingerprint: String = ""
 
-    /// Whether FoundationModels is available on this device
     var isAvailable: Bool {
         SystemLanguageModel.default.availability == .available
     }
 
-    var availabilityReason: SystemLanguageModel.Availability {
-        SystemLanguageModel.default.availability
-    }
-
-    /// Parse natural language input into a structured habit log using on-device AI
+    /// Parse natural language input into a structured habit log using on-device AI.
+    /// Reuses the session when the habit list hasn't changed to avoid cold-start latency.
     func parseInput(_ input: String, habits: [Habit]) async throws -> ParsedHabitLog {
         let habitDescriptions = habits.map { habit -> String in
             let metrics = habit.definedMetrics.map { "\($0.name) (\($0.unit))" }.joined(separator: ", ")
@@ -61,30 +46,27 @@ final class AILoggerService {
         }
 
         let habitList = habitDescriptions.joined(separator: "\n")
+        let fingerprint = habitList
 
-        let instructions = """
-            You are a habit logging assistant for the Trabit app. \
-            The user will describe an activity in natural language. \
-            Extract the habit name, numeric value, and unit. \
-            You MUST match habitName to one of the existing habits below. \
-            Use the exact habit name as listed. \
-            If the user says a synonym (e.g. "ran" for "Running", "swam" for "Swimming", "drank" for "Water"), \
-            map it to the correct habit name. \
-            If no value is given, leave value as nil. \
-            If the habit has no metrics, leave value and unit as nil.
+        if cachedSession == nil || fingerprint != cachedHabitFingerprint {
+            let instructions = """
+                You are a habit logging assistant for the Trabit app. \
+                Extract the habit name and ALL numeric values with their units from the input. \
+                Match habitName to exactly one habit from the list below (use the exact name shown). \
+                Map synonyms: "ran"→Running, "swam"→Swimming, "drank"→Water, "biked"→Biking, etc. \
+                For each number+unit pair in the input, add an entry. \
+                Example: "ran 5km in 30min" → entries:[{value:5,unit:"km"},{value:30,unit:"min"}]. \
+                If the habit has no metrics, return an empty entries array. \
+                If no numbers are given, return an empty entries array.
 
-            Existing habits:
-            \(habitList)
-            """
+                Habits:
+                \(habitList)
+                """
+            cachedSession = LanguageModelSession(instructions: instructions)
+            cachedHabitFingerprint = fingerprint
+        }
 
-        let lookupTool = LookupHabitsTool(habitSummaries: habitDescriptions)
-
-        let session = LanguageModelSession(
-            tools: [lookupTool],
-            instructions: instructions
-        )
-
-        let response = try await session.respond(
+        let response = try await cachedSession!.respond(
             to: input,
             generating: ParsedHabitLog.self
         )
@@ -96,7 +78,6 @@ final class AILoggerService {
 // MARK: - Regex Fallback for Unsupported Devices
 
 struct RegexLogParser {
-    /// The original regex-based parser as a fallback for devices without Apple Intelligence
     static func parse(_ input: String, habits: [Habit]) -> (habit: Habit, entries: [(String, Double)])? {
         let lowered = input.lowercased()
         var matchedHabit: Habit?
@@ -104,16 +85,10 @@ struct RegexLogParser {
         for habit in habits {
             let hName = habit.name.lowercased()
             if lowered.contains(hName) || lowered.contains(String(hName.prefix(4))) {
-                matchedHabit = habit
-                break
+                matchedHabit = habit; break
             }
             if let syns = UnitHelpers.synonyms[hName] {
-                for syn in syns {
-                    if lowered.contains(syn) {
-                        matchedHabit = habit
-                        break
-                    }
-                }
+                for syn in syns where lowered.contains(syn) { matchedHabit = habit; break }
             }
             if matchedHabit != nil { break }
         }
