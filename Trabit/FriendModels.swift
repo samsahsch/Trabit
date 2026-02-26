@@ -1,26 +1,27 @@
-// FriendModels.swift — Local friend connection model for shared goals.
-// Friends are identified by a unique user code. Each user can share goals
-// they explicitly opt-in to sharing. Data is stored locally; sharing is
-// done via exported JSON that a friend imports.
+// FriendModels.swift — SwiftData models for the social/friends feature.
+// Actual real-time data exchange uses CloudKit (CloudKitSocialManager.swift).
+// These local models cache friend data so the app works offline.
 
 import Foundation
 import SwiftData
+import SwiftUI
 
-// MARK: - User Profile
+// MARK: - User Profile (local + synced to CloudKit public DB)
 
-/// Persisted user profile. One instance per device.
 @Model final class UserProfile {
     var displayName: String
-    /// Base64-encoded JPEG thumbnail for the avatar (optional)
     var avatarData: Data?
-    /// Unique code others use to add this person as a friend (e.g. "TRABIT-A1B2C3")
+    /// Readable invite code shown to friends, e.g. "TRABIT-A1B2C3"
     var shareCode: String
-    var createdAt: Date
+    /// CloudKit record name for this user (iCloud record ID)
+    var cloudRecordID: String
+    var joinedAt: Date
 
-    init(name: String) {
+    init(name: String, cloudRecordID: String = "") {
         self.displayName = name
         self.shareCode = UserProfile.generateCode()
-        self.createdAt = Date()
+        self.cloudRecordID = cloudRecordID
+        self.joinedAt = Date()
     }
 
     static func generateCode() -> String {
@@ -30,63 +31,40 @@ import SwiftData
     }
 }
 
-// MARK: - Friend Connection
+// MARK: - Friend Connection (cached locally, source of truth is CloudKit)
 
-/// Represents a friend whose goals we can view. Stored locally.
 @Model final class FriendConnection {
     var friendName: String
     var shareCode: String
+    var friendRecordID: String      // CloudKit record ID
     var avatarData: Data?
     var addedAt: Date
-    /// JSON blob of the friend's shared goals snapshot (updated when they share)
-    var sharedGoalsJSON: String
+    /// Cached JSON array of SharedGoalRecord (refreshed from CloudKit)
+    var cachedGoalsJSON: String
+    var lastRefreshed: Date?
 
-    init(name: String, code: String) {
+    init(name: String, code: String, recordID: String = "") {
         self.friendName = name
         self.shareCode = code
+        self.friendRecordID = recordID
         self.addedAt = Date()
-        self.sharedGoalsJSON = "[]"
-    }
-}
-
-// MARK: - Shared Goal Snapshot (Codable for JSON transfer)
-
-struct SharedGoalSnapshot: Codable, Identifiable {
-    var id: String          // goal UUID string
-    var habitName: String
-    var habitIcon: String
-    var habitColor: String
-    var goalKind: String    // "targetValue" | "deadline" | "consistency"
-    var goalName: String
-    var targetValue: Double?
-    var targetDate: Date?
-    var progressPercent: Double // 0.0–1.0, computed at export time
-    var streakDays: Int
-    var isCompleted: Bool
-}
-
-// MARK: - Share Packet (exported / imported)
-
-struct FriendSharePacket: Codable {
-    var senderName: String
-    var senderCode: String
-    var avatarBase64: String?   // base64-encoded JPEG or nil
-    var sharedGoals: [SharedGoalSnapshot]
-    var exportedAt: Date
-
-    /// Encode to a JSON string suitable for sharing
-    func jsonString() -> String? {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(self) else { return nil }
-        return String(data: data, encoding: .utf8)
+        self.cachedGoalsJSON = "[]"
     }
 
-    /// Decode from a pasted / imported JSON string
-    static func from(jsonString: String) -> FriendSharePacket? {
-        guard let data = jsonString.data(using: .utf8) else { return nil }
+    var cachedGoals: [SharedGoalRecord] {
+        guard let data = cachedGoalsJSON.data(using: .utf8) else { return [] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(FriendSharePacket.self, from: data)
+        return (try? decoder.decode([SharedGoalRecord].self, from: data)) ?? []
+    }
+
+    func updateGoals(_ goals: [SharedGoalRecord]) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if let data = try? encoder.encode(goals),
+           let str = String(data: data, encoding: .utf8) {
+            cachedGoalsJSON = str
+            lastRefreshed = Date()
+        }
     }
 }

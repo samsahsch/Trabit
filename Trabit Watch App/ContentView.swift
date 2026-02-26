@@ -1,7 +1,7 @@
 // ContentView.swift — Trabit Apple Watch App
 // Uses SwiftData with the same App Group store as the main iPhone app.
 // SETUP REQUIRED: In Xcode, add the "App Groups" capability to both the
-// "Trabit" target and "Trabit Watch Watch App" target using "group.com.samsahsch.Trabit".
+// "Trabit" target and "Trabit Watch App" target using "group.com.samsahsch.Trabit".
 
 import SwiftUI
 import SwiftData
