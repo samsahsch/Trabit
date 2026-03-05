@@ -1,18 +1,12 @@
-//
-//  AppIntent.swift
-//  Trabit Watch Widget
-//
-//  Created by Sahel-Schackis, Samuel on 2/25/26.
-//
-
-import WidgetKit
+// AppIntent.swift (Watch Widget) — tapping any complication opens the watch app directly.
+// The watch app handles all logging; intents from complications just deep-link there.
 import AppIntents
 
-struct ConfigurationAppIntent: WidgetConfigurationIntent {
-    static var title: LocalizedStringResource { "Configuration" }
-    static var description: IntentDescription { "This is an example widget." }
+struct WatchOpenIntent: AppIntent {
+    static let title: LocalizedStringResource = "Open Trabit"
+    static var openAppWhenRun: Bool = true
 
-    // An example configurable parameter.
-    @Parameter(title: "Favorite Emoji", default: "😃")
-    var favoriteEmoji: String
+    func perform() async throws -> some IntentResult {
+        .result()
+    }
 }

@@ -6,8 +6,10 @@ struct Trabit_WidgetBundle: WidgetBundle {
     var body: some Widget {
         TrabitSmallWidget()
         TrabitMediumWidget()
-        TrabitLockScreenWidget()
-        TrabitRectangularWidget()
-        TrabitWidgetControl()
+        TrabitLargeWidget()
+        TrabitLockScreenInlineWidget()
+        TrabitLockScreenRectangularWidget()
+        TrabitLockScreenCircularWidget()
+        Trabit_WidgetControl()
     }
 }

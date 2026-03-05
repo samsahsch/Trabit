@@ -1,173 +1,210 @@
-// Trabit_Watch_Widget.swift — Apple Watch Complications
-// Shows habit progress as a circular gauge, rectangular detail, and corner text.
+// Trabit_Watch_Widget.swift — Watch face complications.
+// Shows progress ring + next habit. Tapping a complication opens the Watch app
+// directly to the habit list for one-tap logging.
 
 import WidgetKit
 import SwiftUI
-import SwiftData
+import AppIntents
 
-// MARK: - Shared model container
+private let watchGroupID = "group.com.samsahsch.Trabit"
 
-private func watchWidgetModelContainer() -> ModelContainer? {
-    let schema = Schema([Habit.self])
-    let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-    return try? ModelContainer(for: schema, configurations: [config])
+// MARK: - Cache read (mirrors WatchProgressCache in Watch App)
+
+private func loadWatchCache() -> (completed: Int, total: Int, nextHabit: String, habits: [WatchWidgetHabit]) {
+    let d = UserDefaults(suiteName: watchGroupID) ?? .standard
+    let completed = d.integer(forKey: "watch_completed")
+    let total     = d.integer(forKey: "watch_total")
+    let next      = d.string(forKey: "watch_nextHabit") ?? ""
+    var habits: [WatchWidgetHabit] = []
+    if let data = d.data(forKey: "watch_habits_v2"),
+       let items = try? JSONDecoder().decode([WatchWidgetHabit].self, from: data) {
+        habits = items
+    }
+    return (completed, total, next, habits)
 }
 
-// MARK: - Entry & Provider
+struct WatchWidgetHabit: Codable, Identifiable {
+    var id: String
+    var name: String
+    var icon: String
+    var color: String
+    var isDone: Bool
+}
+
+// MARK: - Timeline Entry
 
 struct WatchEntry: TimelineEntry {
     let date: Date
     let completed: Int
     let total: Int
     let nextHabit: String
+    let habits: [WatchWidgetHabit]
+
+    var progress: Double { total > 0 ? Double(completed) / Double(total) : 0 }
+    var allDone: Bool { total > 0 && completed == total }
 }
+
+// MARK: - Timeline Provider
 
 struct WatchWidgetProvider: TimelineProvider {
     func placeholder(in context: Context) -> WatchEntry {
-        WatchEntry(date: Date(), completed: 2, total: 5, nextHabit: "Running")
+        WatchEntry(date: .now, completed: 2, total: 5, nextHabit: "Running",
+                   habits: [WatchWidgetHabit(id: "1", name: "Running", icon: "figure.run", color: "FF9500", isDone: false)])
     }
 
     func getSnapshot(in context: Context, completion: @escaping (WatchEntry) -> Void) {
-        completion(loadEntry())
+        completion(context.isPreview ? placeholder(in: context) : makeEntry())
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<WatchEntry>) -> Void) {
-        let entry = loadEntry()
-        let next = Calendar.current.nextDate(after: Date(), matching: DateComponents(minute: 0), matchingPolicy: .nextTime) ?? Date().addingTimeInterval(3600)
-        completion(Timeline(entries: [entry], policy: .after(next)))
+        let entry = makeEntry()
+        // Refresh every 15 minutes or at midnight
+        let nextRefresh = Calendar.current.date(byAdding: .minute, value: 15, to: .now) ?? .now
+        completion(Timeline(entries: [entry], policy: .after(nextRefresh)))
     }
 
-    private func loadEntry() -> WatchEntry {
-        guard let container = watchWidgetModelContainer() else {
-            return WatchEntry(date: Date(), completed: 0, total: 0, nextHabit: "")
-        }
-        let context = container.mainContext
-        let all = (try? context.fetch(FetchDescriptor<Habit>(sortBy: [SortDescriptor(\.sortOrder)]))) ?? []
-        let active = all.filter { !$0.isArchived }
-        let today = Date()
-        let completed = active.filter { $0.isCompleted(on: today) }.count
-        let next = active.first(where: { !$0.isCompleted(on: today) })?.name ?? ""
-        return WatchEntry(date: today, completed: completed, total: active.count, nextHabit: next)
+    private func makeEntry() -> WatchEntry {
+        let (completed, total, next, habits) = loadWatchCache()
+        return WatchEntry(date: .now, completed: completed, total: total, nextHabit: next, habits: habits)
     }
 }
 
-// MARK: - Complication Views
+// MARK: - Complications
 
-/// Circular gauge for watch face
-struct WatchCircularView: View {
-    let entry: WatchEntry
-    var progress: Double { entry.total > 0 ? Double(entry.completed) / Double(entry.total) : 0 }
-
-    var body: some View {
-        ZStack {
-            ProgressView(value: progress)
-                .progressViewStyle(.circular)
-                .tint(.blue)
-            VStack(spacing: 0) {
-                Text("\(entry.completed)")
-                    .font(.system(size: 14, weight: .bold, design: .rounded))
-                Text("/\(entry.total)")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .containerBackground(.clear, for: .widget)
-    }
-}
-
-/// Rectangular detail for Infograph Modular
-struct WatchRectangularView: View {
-    let entry: WatchEntry
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 4) {
-                Image(systemName: "checklist")
-                    .font(.caption2)
-                Text("Trabit")
-                    .font(.caption2).bold()
-            }
-            .foregroundStyle(.blue)
-
-            Text("\(entry.completed) of \(entry.total) done")
-                .font(.caption2)
-
-            if !entry.nextHabit.isEmpty {
-                Text("Next: \(entry.nextHabit)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-        }
-        .containerBackground(.clear, for: .widget)
-    }
-}
-
-/// Corner text
-struct WatchCornerView: View {
-    let entry: WatchEntry
-    var body: some View {
-        Text("\(entry.completed)/\(entry.total)")
-            .font(.system(size: 14, weight: .bold, design: .rounded))
-            .containerBackground(.clear, for: .widget)
-    }
-}
-
-/// Inline text
-struct WatchInlineView: View {
-    let entry: WatchEntry
-    var body: some View {
-        Label("\(entry.completed)/\(entry.total) habits", systemImage: "checklist")
-            .containerBackground(.clear, for: .widget)
-    }
-}
-
-// MARK: - Widget Definitions
-
+// 1. Circular — progress gauge with fraction text
 struct TrabitCircularComplication: Widget {
-    let kind = "TrabitCircularComplication"
+    static let kind = "com.samsahsch.Trabit.watch.circular"
+
     var body: some WidgetConfiguration {
-        StaticConfiguration(kind: kind, provider: WatchWidgetProvider()) { entry in
-            WatchCircularView(entry: entry)
+        StaticConfiguration(kind: Self.kind, provider: WatchWidgetProvider()) { entry in
+            CircularView(entry: entry)
+                .widgetURL(URL(string: "trabit://today"))
         }
         .configurationDisplayName("Trabit Progress")
-        .description("Habit completion ring.")
+        .description("Ring showing today's habit progress.")
         .supportedFamilies([.accessoryCircular])
     }
 }
 
-struct TrabitRectangularComplication: Widget {
-    let kind = "TrabitRectangularComplication"
-    var body: some WidgetConfiguration {
-        StaticConfiguration(kind: kind, provider: WatchWidgetProvider()) { entry in
-            WatchRectangularView(entry: entry)
+private struct CircularView: View {
+    let entry: WatchEntry
+    var body: some View {
+        ZStack {
+            AccessoryWidgetBackground()
+            Gauge(value: entry.progress) {
+                Image(systemName: "checkmark")
+            } currentValueLabel: {
+                Text("\(entry.completed)")
+                    .font(.system(size: 11, weight: .bold))
+            }
+            .gaugeStyle(.accessoryCircularCapacity)
+            .tint(entry.allDone ? .green : .blue)
         }
-        .configurationDisplayName("Trabit Detail")
-        .description("Today's habit progress detail.")
+    }
+}
+
+// 2. Rectangular — next habit name + progress bar
+struct TrabitRectangularComplication: Widget {
+    static let kind = "com.samsahsch.Trabit.watch.rectangular"
+
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: Self.kind, provider: WatchWidgetProvider()) { entry in
+            RectangularView(entry: entry)
+                .widgetURL(URL(string: "trabit://today"))
+        }
+        .configurationDisplayName("Trabit Next Habit")
+        .description("Shows your next habit and today's progress.")
         .supportedFamilies([.accessoryRectangular])
     }
 }
 
+private struct RectangularView: View {
+    let entry: WatchEntry
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(entry.allDone ? .green : .blue)
+                Text("Trabit")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(entry.completed)/\(entry.total)")
+                    .font(.caption2.weight(.bold))
+            }
+
+            if entry.allDone {
+                Text("All habits done! 🎉")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.green)
+            } else {
+                Text(entry.nextHabit.isEmpty ? "Open Trabit" : entry.nextHabit)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+            }
+
+            Gauge(value: entry.progress) {}
+                .gaugeStyle(.accessoryLinearCapacity)
+                .tint(entry.allDone ? .green : .blue)
+        }
+    }
+}
+
+// 3. Corner — icon + fraction
 struct TrabitCornerComplication: Widget {
-    let kind = "TrabitCornerComplication"
+    static let kind = "com.samsahsch.Trabit.watch.corner"
+
     var body: some WidgetConfiguration {
-        StaticConfiguration(kind: kind, provider: WatchWidgetProvider()) { entry in
-            WatchCornerView(entry: entry)
+        StaticConfiguration(kind: Self.kind, provider: WatchWidgetProvider()) { entry in
+            CornerView(entry: entry)
+                .widgetURL(URL(string: "trabit://today"))
         }
         .configurationDisplayName("Trabit Corner")
-        .description("Habit count in watch face corner.")
+        .description("Habit progress in the watch corner.")
         .supportedFamilies([.accessoryCorner])
     }
 }
 
+private struct CornerView: View {
+    let entry: WatchEntry
+    var body: some View {
+        Image(systemName: entry.allDone ? "checkmark.seal.fill" : "checkmark.circle")
+            .foregroundStyle(entry.allDone ? .green : .blue)
+            .widgetLabel {
+                Gauge(value: entry.progress) {
+                    Text("\(entry.completed)/\(entry.total)")
+                }
+                .gaugeStyle(.accessoryLinearCapacity)
+                .tint(entry.allDone ? .green : .blue)
+            }
+    }
+}
+
+// 4. Inline — plain text for watch face
 struct TrabitInlineComplication: Widget {
-    let kind = "TrabitInlineComplication"
+    static let kind = "com.samsahsch.Trabit.watch.inline"
+
     var body: some WidgetConfiguration {
-        StaticConfiguration(kind: kind, provider: WatchWidgetProvider()) { entry in
-            WatchInlineView(entry: entry)
+        StaticConfiguration(kind: Self.kind, provider: WatchWidgetProvider()) { entry in
+            InlineView(entry: entry)
+                .widgetURL(URL(string: "trabit://today"))
         }
         .configurationDisplayName("Trabit Inline")
-        .description("Habit count inline on watch face.")
+        .description("Habit count on your watch face.")
         .supportedFamilies([.accessoryInline])
+    }
+}
+
+private struct InlineView: View {
+    let entry: WatchEntry
+    var body: some View {
+        if entry.allDone {
+            Label("All done!", systemImage: "checkmark.seal.fill")
+        } else if !entry.nextHabit.isEmpty {
+            Label("\(entry.completed)/\(entry.total) · \(entry.nextHabit)", systemImage: "checkmark.circle")
+        } else {
+            Label("\(entry.completed)/\(entry.total) habits", systemImage: "checkmark.circle")
+        }
     }
 }

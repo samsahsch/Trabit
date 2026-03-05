@@ -1,239 +1,500 @@
 // Trabit_Widget.swift — iPhone Home Screen & Lock Screen Widgets
-// Uses a shared UserDefaults (App Group) cache written by the main app.
-// To enable live data: add the "App Groups" capability to both the main app
-// and this widget extension, using the group ID "group.com.samsahsch.Trabit".
+// Design: minimum friction to log. Small = next habit + one-tap done.
+// Medium = top 3 habits, each directly loggable. Large = full list + friend nudge.
+// Uses App Group UserDefaults cache written by the main app.
 
 import WidgetKit
 import SwiftUI
+import AppIntents
 
-// MARK: - Shared progress cache (read-only in widgets)
+private let groupID = "group.com.samsahsch.Trabit"
 
-struct WidgetProgressCache {
-    static let suiteName = "group.com.samsahsch.Trabit"
+// MARK: - Cache types
 
-    // Keys
-    static let completedKey = "widget_completed"
-    static let totalKey = "widget_total"
-    static let habitsKey = "widget_habits"   // JSON array of HabitCacheItem
+struct WidgetHabitItem: Codable, Identifiable {
+    var id: String
+    var name: String
+    var icon: String
+    var color: String
+    var isDone: Bool
+    var isMetric: Bool
+}
 
-    struct HabitCacheItem: Codable, Identifiable {
-        var id: String
-        var name: String
-        var icon: String
-        var color: String
-        var isDone: Bool
+struct WidgetFriendItem: Codable, Identifiable {
+    var id: String
+    var name: String
+    var completedToday: Int
+    var totalToday: Int
+}
+
+struct WidgetCache {
+    static let defaults = UserDefaults(suiteName: groupID) ?? .standard
+
+    static func loadHabits() -> [WidgetHabitItem] {
+        guard let data = defaults.data(forKey: "widget_habits_v2"),
+              let items = try? JSONDecoder().decode([WidgetHabitItem].self, from: data)
+        else { return [] }
+        return items
     }
 
-    static func load() -> (completed: Int, total: Int, habits: [HabitCacheItem]) {
-        let defaults = UserDefaults(suiteName: suiteName) ?? .standard
-        let completed = defaults.integer(forKey: completedKey)
-        let total = defaults.integer(forKey: totalKey)
-        var habits: [HabitCacheItem] = []
-        if let data = defaults.data(forKey: habitsKey),
-           let decoded = try? JSONDecoder().decode([HabitCacheItem].self, from: data) {
-            habits = decoded
+    static func loadFriends() -> [WidgetFriendItem] {
+        guard let data = defaults.data(forKey: "widget_friends"),
+              let items = try? JSONDecoder().decode([WidgetFriendItem].self, from: data)
+        else { return [] }
+        return items
+    }
+
+    static func loadCounts() -> (completed: Int, total: Int) {
+        (defaults.integer(forKey: "widget_completed"), defaults.integer(forKey: "widget_total"))
+    }
+}
+
+// MARK: - Complete-habit intent (no app open for non-metric habits)
+
+struct WidgetCompleteHabitIntent: AppIntent {
+    static let title: LocalizedStringResource = "Complete Habit"
+    static var openAppWhenRun: Bool = false
+
+    @Parameter(title: "Habit ID") var habitID: String
+
+    init() { self.habitID = "" }
+    init(habitID: String) { self.habitID = habitID }
+
+    @MainActor
+    func perform() async throws -> some IntentResult {
+        // Update the UserDefaults cache directly so the widget reflects change instantly
+        let d = UserDefaults(suiteName: groupID) ?? .standard
+        guard var habits = try? JSONDecoder().decode([WidgetHabitItem].self, from: d.data(forKey: "widget_habits_v2") ?? Data())
+        else { return .result() }
+
+        if let idx = habits.firstIndex(where: { $0.id == habitID }) {
+            habits[idx].isDone = true
         }
-        return (completed, total, habits)
-    }
-
-    /// Called from the main app to update widget data.
-    static func save(completed: Int, total: Int, habits: [HabitCacheItem]) {
-        let defaults = UserDefaults(suiteName: suiteName) ?? .standard
-        defaults.set(completed, forKey: completedKey)
-        defaults.set(total, forKey: totalKey)
         if let data = try? JSONEncoder().encode(habits) {
-            defaults.set(data, forKey: habitsKey)
+            d.set(data, forKey: "widget_habits_v2")
         }
+        let done = habits.filter(\.isDone).count
+        d.set(done, forKey: "widget_completed")
         WidgetCenter.shared.reloadAllTimelines()
+        return .result()
     }
+}
+
+// Open app to log a metric habit (needs numeric input)
+struct WidgetOpenHabitIntent: AppIntent {
+    static let title: LocalizedStringResource = "Log Metric Habit"
+    static var openAppWhenRun: Bool = true
+
+    @Parameter(title: "Habit ID") var habitID: String
+    init() { self.habitID = "" }
+    init(habitID: String) { self.habitID = habitID }
+
+    func perform() async throws -> some IntentResult { .result() }
 }
 
 // MARK: - Timeline Entry
 
-struct TrabitWidgetEntry: TimelineEntry {
+struct WidgetEntry: TimelineEntry {
     let date: Date
-    let habits: [WidgetProgressCache.HabitCacheItem]
+    let habits: [WidgetHabitItem]
     let completed: Int
     let total: Int
+    let friends: [WidgetFriendItem]
+
+    var progress: Double { total > 0 ? Double(completed) / Double(total) : 0 }
+    var incomplete: [WidgetHabitItem] { habits.filter { !$0.isDone } }
+    var allDone: Bool { total > 0 && completed == total }
 }
 
 // MARK: - Timeline Provider
 
 struct TrabitWidgetProvider: TimelineProvider {
-    func placeholder(in context: Context) -> TrabitWidgetEntry {
-        TrabitWidgetEntry(date: Date(), habits: [
-            .init(id: "1", name: "Running", icon: "figure.run", color: "FF9500", isDone: true),
-            .init(id: "2", name: "Water", icon: "drop.fill", color: "007AFF", isDone: false),
-            .init(id: "3", name: "Floss", icon: "sparkles", color: "34C759", isDone: false),
-        ], completed: 1, total: 3)
+    func placeholder(in context: Context) -> WidgetEntry {
+        WidgetEntry(date: .now,
+                    habits: [
+                        WidgetHabitItem(id: "1", name: "Running", icon: "figure.run", color: "FF9500", isDone: true, isMetric: true),
+                        WidgetHabitItem(id: "2", name: "Water", icon: "drop.fill", color: "007AFF", isDone: false, isMetric: false),
+                        WidgetHabitItem(id: "3", name: "Floss", icon: "sparkles", color: "34C759", isDone: false, isMetric: false),
+                    ],
+                    completed: 1, total: 3,
+                    friends: [WidgetFriendItem(id: "f1", name: "Alex", completedToday: 2, totalToday: 3)])
     }
 
-    func getSnapshot(in context: Context, completion: @escaping (TrabitWidgetEntry) -> Void) {
-        completion(loadEntry())
+    func getSnapshot(in context: Context, completion: @escaping (WidgetEntry) -> Void) {
+        completion(context.isPreview ? placeholder(in: context) : makeEntry())
     }
 
-    func getTimeline(in context: Context, completion: @escaping (Timeline<TrabitWidgetEntry>) -> Void) {
-        let entry = loadEntry()
-        let nextUpdate = Calendar.current.nextDate(after: Date(), matching: DateComponents(minute: 0), matchingPolicy: .nextTime) ?? Date().addingTimeInterval(3600)
-        completion(Timeline(entries: [entry], policy: .after(nextUpdate)))
+    func getTimeline(in context: Context, completion: @escaping (Timeline<WidgetEntry>) -> Void) {
+        let entry = makeEntry()
+        let next = Calendar.current.nextDate(after: .now, matching: DateComponents(minute: 0), matchingPolicy: .nextTime) ?? Date(timeIntervalSinceNow: 3600)
+        completion(Timeline(entries: [entry], policy: .after(next)))
     }
 
-    private func loadEntry() -> TrabitWidgetEntry {
-        let cache = WidgetProgressCache.load()
-        return TrabitWidgetEntry(date: Date(), habits: cache.habits, completed: cache.completed, total: cache.total)
-    }
-}
-
-// MARK: - Small Widget View
-
-struct TrabitSmallWidgetView: View {
-    let entry: TrabitWidgetEntry
-
-    var progress: Double {
-        guard entry.total > 0 else { return 0 }
-        return Double(entry.completed) / Double(entry.total)
-    }
-
-    var body: some View {
-        VStack(spacing: 6) {
-            ZStack {
-                Circle()
-                    .stroke(Color.white.opacity(0.2), lineWidth: 8)
-                Circle()
-                    .trim(from: 0, to: progress)
-                    .stroke(Color.white, style: StrokeStyle(lineWidth: 8, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-                VStack(spacing: 0) {
-                    Text("\(entry.completed)")
-                        .font(.title2).bold()
-                    Text("of \(entry.total)")
-                        .font(.caption2).opacity(0.7)
-                }
-            }
-            .frame(width: 72, height: 72)
-
-            Text(progress == 1 ? "All done!" : "\(entry.total - entry.completed) left")
-                .font(.caption2).opacity(0.8)
-        }
-        .foregroundStyle(.white)
-        .containerBackground(Color.blue.gradient, for: .widget)
+    private func makeEntry() -> WidgetEntry {
+        let habits = WidgetCache.loadHabits()
+        let (completed, total) = WidgetCache.loadCounts()
+        let friends = WidgetCache.loadFriends()
+        return WidgetEntry(date: .now, habits: habits, completed: completed, total: total, friends: friends)
     }
 }
 
-// MARK: - Medium Widget View
+// MARK: - Small Widget: Next habit + progress ring
 
-struct TrabitMediumWidgetView: View {
-    let entry: TrabitWidgetEntry
+struct SmallWidgetView: View {
+    let entry: WidgetEntry
 
     var body: some View {
-        HStack(spacing: 14) {
-            VStack(spacing: 4) {
+        ZStack {
+            // Background gradient
+            LinearGradient(
+                colors: entry.allDone ? [Color(hex: "1a472a"), Color(hex: "2d6a4f")] : [Color(hex: "0a0f2e"), Color(hex: "1a237e")],
+                startPoint: .topLeading, endPoint: .bottomTrailing
+            )
+
+            VStack(spacing: 8) {
+                // Progress ring
                 ZStack {
                     Circle()
-                        .stroke(Color.white.opacity(0.2), lineWidth: 6)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 8)
                     Circle()
-                        .trim(from: 0, to: entry.total > 0 ? Double(entry.completed) / Double(entry.total) : 0)
-                        .stroke(Color.white, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                        .trim(from: 0, to: entry.progress)
+                        .stroke(
+                            entry.allDone ? Color.green : Color.white,
+                            style: StrokeStyle(lineWidth: 8, lineCap: .round)
+                        )
                         .rotationEffect(.degrees(-90))
-                    Text("\(entry.completed)/\(entry.total)")
-                        .font(.caption2).bold()
+                    VStack(spacing: 0) {
+                        Text("\(entry.completed)")
+                            .font(.system(size: 22, weight: .bold, design: .rounded))
+                        Text("/ \(entry.total)")
+                            .font(.system(size: 10))
+                            .opacity(0.6)
+                    }
                 }
-                .frame(width: 48, height: 48)
-                Text("Today")
-                    .font(.caption2).opacity(0.7)
-            }
-            .foregroundStyle(.white)
+                .frame(width: 70, height: 70)
+                .foregroundStyle(.white)
 
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(entry.habits.prefix(4)) { h in
-                    HStack(spacing: 6) {
-                        Image(systemName: h.isDone ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(h.isDone ? .green : Color.white.opacity(0.35))
-                            .font(.caption)
-                        Text(h.name)
-                            .font(.caption)
-                            .foregroundStyle(h.isDone ? Color.white.opacity(0.4) : Color.white)
-                            .strikethrough(h.isDone)
-                            .lineLimit(1)
+                if entry.allDone {
+                    Text("All done!")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.green)
+                } else if let next = entry.incomplete.first {
+                    // Tap to complete directly (or open app for metric)
+                    if next.isMetric {
+                        Link(destination: URL(string: "trabit://log/\(next.id)")!) {
+                            HabitPill(habit: next)
+                        }
+                    } else {
+                        Button(intent: WidgetCompleteHabitIntent(habitID: next.id)) {
+                            HabitPill(habit: next)
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
             }
-            Spacer()
+            .padding(10)
         }
-        .padding(.horizontal, 16)
-        .containerBackground(Color(red: 0.07, green: 0.07, blue: 0.18).gradient, for: .widget)
+        .containerBackground(for: .widget) { Color(hex: "0a0f2e") }
+        .widgetURL(URL(string: "trabit://today"))
+    }
+}
+
+// MARK: - Medium Widget: 3 habits, each directly loggable
+
+struct MediumWidgetView: View {
+    let entry: WidgetEntry
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Left: progress ring
+            VStack(spacing: 4) {
+                ZStack {
+                    Circle()
+                        .stroke(Color.white.opacity(0.15), lineWidth: 6)
+                    Circle()
+                        .trim(from: 0, to: entry.progress)
+                        .stroke(
+                            entry.allDone ? Color.green : Color.white,
+                            style: StrokeStyle(lineWidth: 6, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(-90))
+                    VStack(spacing: 0) {
+                        Text("\(entry.completed)")
+                            .font(.system(size: 16, weight: .bold, design: .rounded))
+                        Text("/\(entry.total)")
+                            .font(.system(size: 9)).opacity(0.6)
+                    }
+                }
+                .frame(width: 52, height: 52)
+                .foregroundStyle(.white)
+                Text("today")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+
+            // Right: habit rows
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(entry.habits.prefix(4)) { habit in
+                    MediumHabitRow(habit: habit)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .containerBackground(
+            LinearGradient(colors: [Color(hex: "0a0f2e"), Color(hex: "1a237e")], startPoint: .topLeading, endPoint: .bottomTrailing),
+            for: .widget
+        )
+        .widgetURL(URL(string: "trabit://today"))
+    }
+}
+
+// MARK: - Large Widget: full list + friend nudge
+
+struct LargeWidgetView: View {
+    let entry: WidgetEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Header
+            HStack {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Trabit")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.white.opacity(0.5))
+                    Text(entry.allDone ? "All done today!" : "\(entry.total - entry.completed) left")
+                        .font(.headline.weight(.bold))
+                        .foregroundStyle(entry.allDone ? .green : .white)
+                }
+                Spacer()
+                ZStack {
+                    Circle().stroke(Color.white.opacity(0.15), lineWidth: 5)
+                    Circle()
+                        .trim(from: 0, to: entry.progress)
+                        .stroke(entry.allDone ? Color.green : Color.white, style: StrokeStyle(lineWidth: 5, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                    Text("\(Int(entry.progress * 100))%")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                }
+                .frame(width: 42, height: 42)
+            }
+
+            Divider().background(Color.white.opacity(0.1))
+
+            // Habit list
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(entry.habits.prefix(6)) { habit in
+                    MediumHabitRow(habit: habit)
+                }
+            }
+
+            // Friend nudge (if any friend is active today)
+            if let friend = entry.friends.first(where: { $0.totalToday > 0 }) {
+                Divider().background(Color.white.opacity(0.1))
+                HStack(spacing: 6) {
+                    Image(systemName: "person.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.blue)
+                    let pct = friend.totalToday > 0 ? Int(Double(friend.completedToday) / Double(friend.totalToday) * 100) : 0
+                    Text("\(friend.name): \(pct)% done")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .containerBackground(
+            LinearGradient(colors: [Color(hex: "0a0f2e"), Color(hex: "1a237e")], startPoint: .topLeading, endPoint: .bottomTrailing),
+            for: .widget
+        )
+        .widgetURL(URL(string: "trabit://today"))
     }
 }
 
 // MARK: - Lock Screen Views
 
-struct TrabitInlineView: View {
-    let entry: TrabitWidgetEntry
+struct LockScreenInlineView: View {
+    let entry: WidgetEntry
     var body: some View {
-        Label("\(entry.completed)/\(entry.total) habits", systemImage: "checklist")
+        if entry.allDone {
+            Label("All done!", systemImage: "checkmark.seal.fill")
+        } else if let next = entry.incomplete.first {
+            Label("\(entry.completed)/\(entry.total) · \(next.name)", systemImage: "checkmark.circle")
+        } else {
+            Label("\(entry.completed)/\(entry.total) habits", systemImage: "checklist")
+        }
     }
 }
 
-struct TrabitRectangularView: View {
-    let entry: TrabitWidgetEntry
+struct LockScreenRectangularView: View {
+    let entry: WidgetEntry
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Label("Trabit", systemImage: "checklist").font(.caption2).bold()
-            Text("\(entry.completed) of \(entry.total) habits done")
-                .font(.caption2)
-            if let next = entry.habits.first(where: { !$0.isDone }) {
-                Text("Next: \(next.name)").font(.caption2).opacity(0.7)
+            HStack {
+                Image(systemName: "checkmark.circle.fill").font(.caption2)
+                Text("Trabit").font(.caption2.weight(.bold))
+                Spacer()
+                Text("\(entry.completed)/\(entry.total)").font(.caption2.weight(.bold))
+            }
+            if entry.allDone {
+                Text("All habits complete!")
+                    .font(.caption2)
+                    .foregroundStyle(.green)
+            } else if let next = entry.incomplete.first {
+                Text("Next: \(next.name)").font(.caption2)
             }
         }
     }
 }
 
-// MARK: - Widget Structs
+struct LockScreenCircularView: View {
+    let entry: WidgetEntry
+    var body: some View {
+        Gauge(value: entry.progress) {
+            Image(systemName: "checkmark")
+        } currentValueLabel: {
+            Text("\(entry.completed)")
+        }
+        .gaugeStyle(.accessoryCircularCapacity)
+    }
+}
+
+// MARK: - Reusable subviews
+
+private struct HabitPill: View {
+    let habit: WidgetHabitItem
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: habit.icon)
+                .font(.system(size: 10))
+                .foregroundStyle(Color(hex: habit.color))
+            Text(habit.name)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(Capsule().fill(Color.white.opacity(0.12)))
+    }
+}
+
+private struct MediumHabitRow: View {
+    let habit: WidgetHabitItem
+    var body: some View {
+        Group {
+            if habit.isDone {
+                habitContent
+            } else if habit.isMetric {
+                Link(destination: URL(string: "trabit://log/\(habit.id)")!) {
+                    habitContent
+                }
+            } else {
+                Button(intent: WidgetCompleteHabitIntent(habitID: habit.id)) {
+                    habitContent
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var habitContent: some View {
+        HStack(spacing: 7) {
+            Image(systemName: habit.isDone ? "checkmark.circle.fill" : habit.icon)
+                .font(.system(size: 13))
+                .foregroundStyle(habit.isDone ? Color.green : Color(hex: habit.color))
+                .frame(width: 18)
+            Text(habit.name)
+                .font(.system(size: 13, weight: habit.isDone ? .regular : .medium))
+                .foregroundStyle(habit.isDone ? Color.white.opacity(0.35) : Color.white)
+                .strikethrough(habit.isDone, color: .white.opacity(0.3))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            if !habit.isDone && !habit.isMetric {
+                Image(systemName: "plus.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.4))
+            }
+        }
+    }
+}
+
+// MARK: - Color hex extension
+
+extension Color {
+    init(hex: String) {
+        let h = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: h).scanHexInt64(&int)
+        let r, g, b: UInt64
+        switch h.count {
+        case 6: (r, g, b) = (int >> 16, int >> 8 & 0xFF, int & 0xFF)
+        default: (r, g, b) = (1, 1, 1)
+        }
+        self.init(.sRGB, red: Double(r)/255, green: Double(g)/255, blue: Double(b)/255)
+    }
+}
+
+// MARK: - Widget structs
 
 struct TrabitSmallWidget: Widget {
     let kind = "TrabitSmallWidget"
     var body: some WidgetConfiguration {
-        StaticConfiguration(kind: kind, provider: TrabitWidgetProvider()) { entry in
-            TrabitSmallWidgetView(entry: entry)
-        }
-        .configurationDisplayName("Trabit Progress")
-        .description("Today's habit completion ring.")
-        .supportedFamilies([.systemSmall])
+        StaticConfiguration(kind: kind, provider: TrabitWidgetProvider()) { SmallWidgetView(entry: $0) }
+            .configurationDisplayName("Trabit Progress")
+            .description("Next habit + progress ring. Tap to complete.")
+            .supportedFamilies([.systemSmall])
     }
 }
 
 struct TrabitMediumWidget: Widget {
     let kind = "TrabitMediumWidget"
     var body: some WidgetConfiguration {
-        StaticConfiguration(kind: kind, provider: TrabitWidgetProvider()) { entry in
-            TrabitMediumWidgetView(entry: entry)
-        }
-        .configurationDisplayName("Trabit Habits")
-        .description("Your habit list for today.")
-        .supportedFamilies([.systemMedium])
+        StaticConfiguration(kind: kind, provider: TrabitWidgetProvider()) { MediumWidgetView(entry: $0) }
+            .configurationDisplayName("Trabit Habits")
+            .description("Habit list with tap-to-complete.")
+            .supportedFamilies([.systemMedium])
     }
 }
 
-struct TrabitLockScreenWidget: Widget {
+struct TrabitLargeWidget: Widget {
+    let kind = "TrabitLargeWidget"
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: kind, provider: TrabitWidgetProvider()) { LargeWidgetView(entry: $0) }
+            .configurationDisplayName("Trabit Full List")
+            .description("All habits + friend progress.")
+            .supportedFamilies([.systemLarge])
+    }
+}
+
+struct TrabitLockScreenInlineWidget: Widget {
     let kind = "TrabitLockScreenWidget"
     var body: some WidgetConfiguration {
-        StaticConfiguration(kind: kind, provider: TrabitWidgetProvider()) { entry in
-            TrabitInlineView(entry: entry)
-        }
-        .configurationDisplayName("Trabit")
-        .description("Today's habit count on your lock screen.")
-        .supportedFamilies([.accessoryInline])
+        StaticConfiguration(kind: kind, provider: TrabitWidgetProvider()) { LockScreenInlineView(entry: $0) }
+            .configurationDisplayName("Trabit")
+            .description("Habit count on your lock screen.")
+            .supportedFamilies([.accessoryInline])
     }
 }
 
-struct TrabitRectangularWidget: Widget {
+struct TrabitLockScreenRectangularWidget: Widget {
     let kind = "TrabitRectangularWidget"
     var body: some WidgetConfiguration {
-        StaticConfiguration(kind: kind, provider: TrabitWidgetProvider()) { entry in
-            TrabitRectangularView(entry: entry)
-        }
-        .configurationDisplayName("Trabit Detail")
-        .description("Habit progress detail on your lock screen.")
-        .supportedFamilies([.accessoryRectangular])
+        StaticConfiguration(kind: kind, provider: TrabitWidgetProvider()) { LockScreenRectangularView(entry: $0) }
+            .configurationDisplayName("Trabit Detail")
+            .description("Next habit on your lock screen.")
+            .supportedFamilies([.accessoryRectangular])
+    }
+}
+
+struct TrabitLockScreenCircularWidget: Widget {
+    let kind = "TrabitCircularWidget"
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: kind, provider: TrabitWidgetProvider()) { LockScreenCircularView(entry: $0) }
+            .configurationDisplayName("Trabit Ring")
+            .description("Progress ring on your lock screen.")
+            .supportedFamilies([.accessoryCircular])
     }
 }

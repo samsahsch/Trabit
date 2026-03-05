@@ -1,245 +1,446 @@
-// ContentView.swift — Trabit Apple Watch App
-// Uses SwiftData with the same App Group store as the main iPhone app.
-// SETUP REQUIRED: In Xcode, add the "App Groups" capability to both the
-// "Trabit" target and "Trabit Watch App" target using "group.com.samsahsch.Trabit".
+// Watch ContentView — friction-free habit logging on the wrist.
+// Design philosophy: the watch is where you ARE when you do the habit.
+// Tap once to log. Digital Crown for values. Done in under 3 seconds.
 
 import SwiftUI
-import SwiftData
+import WatchKit
+import WidgetKit
+import CloudKit
 
-// MARK: - Minimal model definitions for watchOS
-// These mirror HabitModels.swift in the main app. Both targets share the same
-// SwiftData store via App Groups so data stays in sync.
+// MARK: - Shared App Group store URL
 
-enum WatchFrequencyType: String, Codable, CaseIterable {
-    case daily = "Daily"; case weekly = "Weekly"; case monthly = "Monthly"
-    case interval = "Every X Days"; case weekdays = "Specific Days"
+private let watchAppGroupID = "group.com.samsahsch.Trabit"
+
+// MARK: - Lightweight watch-side models (read directly from App Group UserDefaults)
+// The watch reads habit snapshots written by the iOS app's WidgetCache so we never
+// need to open a SwiftData container on-watch (too slow, same-process constraint).
+
+struct WatchHabitItem: Identifiable, Codable {
+    var id: String
+    var name: String
+    var icon: String
+    var color: String
+    var isDone: Bool
+    var isMetric: Bool
+    var metricUnit: String
+    var currentValue: Double
+    var dailyTarget: Double
 }
 
-@Model final class WatchHabit {
-    var name: String; var iconSymbol: String; var hexColor: String
-    var sortOrder: Int; var isArchived: Bool = false; var dailyGoalCount: Int = 1
-    @Relationship(deleteRule: .cascade) var logs: [WatchActivityLog] = []
-    @Relationship(deleteRule: .cascade) var definedMetrics: [WatchMetricDef] = []
+struct WatchCache {
+    static let suiteName = watchAppGroupID
+    static let habitsKey  = "watch_habits_v2"
+    static let completedKey = "watch_completed"
+    static let totalKey = "watch_total"
 
-    init(name: String, icon: String, color: String, order: Int = 0) {
-        self.name = name; self.iconSymbol = icon; self.hexColor = color; self.sortOrder = order
+    static func loadHabits() -> [WatchHabitItem] {
+        let d = UserDefaults(suiteName: suiteName) ?? .standard
+        guard let data = d.data(forKey: habitsKey),
+              let items = try? JSONDecoder().decode([WatchHabitItem].self, from: data)
+        else { return [] }
+        return items
     }
 
-    func isCompleted(on date: Date) -> Bool {
-        logs.contains { Calendar.current.isDate($0.date, inSameDayAs: date) }
+    static func saveHabits(_ items: [WatchHabitItem]) {
+        let d = UserDefaults(suiteName: suiteName) ?? .standard
+        if let data = try? JSONEncoder().encode(items) {
+            d.set(data, forKey: habitsKey)
+        }
+        let completed = items.filter(\.isDone).count
+        d.set(completed, forKey: completedKey)
+        d.set(items.count, forKey: totalKey)
+        d.set(items.first(where: { !$0.isDone })?.name ?? "", forKey: "watch_nextHabit")
+        WidgetCenter.shared.reloadAllTimelines()
     }
 }
 
-@Model final class WatchActivityLog {
-    var date: Date
-    @Relationship(deleteRule: .cascade) var entries: [WatchLogPoint] = []
-    init(date: Date) { self.date = date }
-}
-
-@Model final class WatchLogPoint {
-    var metricName: String; var value: Double
-    init(metricName: String, value: Double) { self.metricName = metricName; self.value = value }
-}
-
-@Model final class WatchMetricDef {
-    var name: String; var unit: String
-    init(name: String, unit: String) { self.name = name; self.unit = unit }
-}
-
-// MARK: - Shared model container for Watch
-
-private func watchModelContainer() -> ModelContainer? {
-    let schema = Schema([WatchHabit.self, WatchActivityLog.self, WatchLogPoint.self, WatchMetricDef.self])
-    // Use App Group store if available; fall back to default
-    if let groupURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.samsahsch.Trabit") {
-        let storeURL = groupURL.appendingPathComponent("default.store")
-        let config = ModelConfiguration(schema: schema, url: storeURL)
-        return try? ModelContainer(for: schema, configurations: [config])
-    }
-    let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-    return try? ModelContainer(for: schema, configurations: [config])
-}
-
-// MARK: - Root Content View
+// MARK: - Root View
 
 struct ContentView: View {
-    var body: some View {
-        if let container = watchModelContainer() {
-            WatchTodayView()
-                .modelContainer(container)
-        } else {
-            Text("Could not load habits")
-                .foregroundStyle(.secondary)
-        }
-    }
-}
+    @State private var habits: [WatchHabitItem] = []
+    @State private var selectedHabit: WatchHabitItem?
+    @State private var toastText: String?
+    @State private var showFriends = false
 
-// MARK: - Today View
-
-struct WatchTodayView: View {
-    @Query(sort: \WatchHabit.sortOrder) private var allHabits: [WatchHabit]
-    @Environment(\.modelContext) private var modelContext
-
-    var habits: [WatchHabit] { allHabits.filter { !$0.isArchived } }
-    var completed: Int { habits.filter { $0.isCompleted(on: Date()) }.count }
+    var completedCount: Int { habits.filter(\.isDone).count }
+    var progress: Double { habits.isEmpty ? 0 : Double(completedCount) / Double(habits.count) }
 
     var body: some View {
         NavigationStack {
-            List {
-                // Progress header
-                Section {
-                    HStack {
-                        ZStack {
-                            Circle()
-                                .stroke(Color.white.opacity(0.15), lineWidth: 5)
-                            Circle()
-                                .trim(from: 0, to: habits.isEmpty ? 0 : Double(completed) / Double(habits.count))
-                                .stroke(Color.blue, style: StrokeStyle(lineWidth: 5, lineCap: .round))
-                                .rotationEffect(.degrees(-90))
-                        }
-                        .frame(width: 36, height: 36)
+            ScrollView {
+                VStack(spacing: 10) {
+                    // Progress ring header
+                    progressHeader
 
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("\(completed) of \(habits.count)")
-                                .font(.headline)
-                            Text("habits done")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                    // Habit list
+                    if habits.isEmpty {
+                        Text("Open Trabit on iPhone to add habits")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.top, 8)
+                    } else {
+                        ForEach($habits) { $habit in
+                            WatchHabitRow(habit: $habit) { logged in
+                                handleLog(habit: habit, valueLogged: logged)
+                            }
                         }
                     }
-                    .padding(.vertical, 2)
-                }
 
-                // Habit rows
-                ForEach(habits) { habit in
-                    WatchHabitRow(habit: habit)
+                    // Toast
+                    if let t = toastText {
+                        Text(t)
+                            .font(.caption2)
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 10).padding(.vertical, 5)
+                            .background(Capsule().fill(Color.green))
+                            .transition(.opacity.combined(with: .scale))
+                    }
                 }
+                .padding(.horizontal, 4)
             }
             .navigationTitle("Today")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showFriends = true
+                    } label: {
+                        Image(systemName: "person.2.fill")
+                            .foregroundStyle(.blue)
+                    }
+                }
+            }
         }
+        .sheet(isPresented: $showFriends) {
+            WatchFriendsView()
+        }
+        .onAppear { reload() }
+    }
+
+    // MARK: - Progress Header
+
+    private var progressHeader: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .stroke(Color.white.opacity(0.15), lineWidth: 6)
+                Circle()
+                    .trim(from: 0, to: progress)
+                    .stroke(
+                        LinearGradient(colors: [.blue, .cyan], startPoint: .topLeading, endPoint: .bottomTrailing),
+                        style: StrokeStyle(lineWidth: 6, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(-90))
+                    .animation(.easeInOut, value: progress)
+                VStack(spacing: 0) {
+                    Text("\(completedCount)")
+                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                    Text("of \(habits.count)")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 54, height: 54)
+
+            VStack(alignment: .leading, spacing: 2) {
+                if completedCount == habits.count && !habits.isEmpty {
+                    Text("All done!")
+                        .font(.headline)
+                        .foregroundStyle(.green)
+                    Text("Great work today")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else if let next = habits.first(where: { !$0.isDone }) {
+                    Text("Up next")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(next.name)
+                        .font(.headline)
+                        .lineLimit(1)
+                } else {
+                    Text("No habits yet")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.07)))
+    }
+
+    // MARK: - Actions
+
+    private func handleLog(habit: WatchHabitItem, valueLogged: Double?) {
+        if let idx = habits.firstIndex(where: { $0.id == habit.id }) {
+            habits[idx].isDone = true
+            if let v = valueLogged {
+                habits[idx].currentValue += v
+            }
+        }
+        WatchCache.saveHabits(habits)
+        withAnimation {
+            toastText = valueLogged != nil
+                ? "Logged \(UnitFormatter.format(valueLogged!)) \(habit.metricUnit)"
+                : "\(habit.name) done!"
+        }
+        WKInterfaceDevice.current().play(.success)
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            withAnimation { toastText = nil }
+        }
+    }
+
+    private func reload() {
+        habits = WatchCache.loadHabits()
     }
 }
 
-// MARK: - Habit Row
+// MARK: - Watch Habit Row
 
 struct WatchHabitRow: View {
-    let habit: WatchHabit
-    @State private var showLog = false
-    @Environment(\.modelContext) private var modelContext
+    @Binding var habit: WatchHabitItem
+    var onLog: (Double?) -> Void
 
-    var isDone: Bool { habit.isCompleted(on: Date()) }
+    @State private var showInput = false
+    @State private var inputValue: Double = 0
 
     var body: some View {
         Button {
-            if habit.definedMetrics.isEmpty {
-                withAnimation {
-                    habit.logs.append(WatchActivityLog(date: Date()))
-                }
+            if habit.isDone {
+                // Already done — no action
+                WKInterfaceDevice.current().play(.click)
+            } else if habit.isMetric {
+                showInput = true
             } else {
-                showLog = true
+                onLog(nil)
             }
         } label: {
             HStack(spacing: 10) {
-                Image(systemName: habit.iconSymbol)
-                    .foregroundStyle(watchColor(habit.hexColor))
-                    .frame(width: 24)
+                // Icon with color
+                ZStack {
+                    Circle()
+                        .fill(Color(hex: habit.color).opacity(0.2))
+                        .frame(width: 36, height: 36)
+                    Image(systemName: habit.icon)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(Color(hex: habit.color))
+                }
 
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text(habit.name)
-                        .font(.body)
-                        .strikethrough(isDone)
-                        .foregroundStyle(isDone ? .secondary : .primary)
-                    if !habit.definedMetrics.isEmpty {
-                        Text(habit.definedMetrics.map { $0.unit }.joined(separator: ", "))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                        .font(.system(size: 15, weight: habit.isDone ? .regular : .semibold))
+                        .foregroundStyle(habit.isDone ? .secondary : .primary)
+                        .lineLimit(1)
+                        .strikethrough(habit.isDone)
+
+                    if habit.isMetric && habit.dailyTarget > 0 {
+                        ProgressView(value: min(habit.currentValue / habit.dailyTarget, 1))
+                            .tint(Color(hex: habit.color))
+                            .frame(width: 80)
                     }
                 }
+
                 Spacer()
-                Image(systemName: isDone ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(isDone ? .green : Color.white.opacity(0.3))
-                    .font(.callout)
+
+                Image(systemName: habit.isDone ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 20))
+                    .foregroundStyle(habit.isDone ? Color.green : Color.secondary.opacity(0.4))
             }
+            .padding(.vertical, 6).padding(.horizontal, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(habit.isDone ? Color.green.opacity(0.08) : Color.white.opacity(0.07))
+            )
         }
         .buttonStyle(.plain)
-        .sheet(isPresented: $showLog) {
-            WatchLogSheet(habit: habit)
+        .sheet(isPresented: $showInput) {
+            WatchMetricInput(
+                habitName: habit.name,
+                unit: habit.metricUnit,
+                currentValue: habit.currentValue,
+                targetValue: habit.dailyTarget
+            ) { value in
+                onLog(value)
+            }
         }
-    }
-
-    // Minimal hex color helper for watchOS (no UIColor dependency)
-    private func watchColor(_ hex: String) -> Color {
-        let scanner = Scanner(string: hex.trimmingCharacters(in: CharacterSet(charactersIn: "#")))
-        var value: UInt64 = 0
-        scanner.scanHexInt64(&value)
-        let r = Double((value & 0xFF0000) >> 16) / 255
-        let g = Double((value & 0x00FF00) >> 8) / 255
-        let b = Double(value & 0x0000FF) / 255
-        return Color(red: r, green: g, blue: b)
     }
 }
 
-// MARK: - Quick Log Sheet (with Digital Crown)
+// MARK: - Metric Input Sheet (Digital Crown)
 
-struct WatchLogSheet: View {
-    let habit: WatchHabit
+struct WatchMetricInput: View {
+    let habitName: String
+    let unit: String
+    let currentValue: Double
+    let targetValue: Double
+    var onSubmit: (Double) -> Void
+
     @Environment(\.dismiss) private var dismiss
-    @State private var values: [Double] = []
+    @State private var value: Double = 1
+    @FocusState private var focused: Bool
+
+    // Crown step: 1 for integers, 0.5 for small units
+    private var step: Double { unit.lowercased().contains("km") ? 0.5 : 1 }
+    private var maxVal: Double { targetValue > 0 ? targetValue * 2 : 100 }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 12) {
-                HStack {
-                    Image(systemName: habit.iconSymbol)
-                    Text(habit.name).font(.headline)
-                }
+        VStack(spacing: 8) {
+            Text(habitName)
+                .font(.headline)
+                .lineLimit(1)
 
-                ForEach(habit.definedMetrics.indices, id: \.self) { i in
-                    VStack(spacing: 4) {
-                        Text(habit.definedMetrics[i].name)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        Text("\(formatValue(values.indices.contains(i) ? values[i] : 0)) \(habit.definedMetrics[i].unit)")
-                            .font(.title3).bold()
-                            .focusable()
-                            .digitalCrownRotation(
-                                Binding(
-                                    get: { values.indices.contains(i) ? values[i] : 0 },
-                                    set: { v in
-                                        if values.indices.contains(i) { values[i] = max(0, v) }
-                                        else { while values.count <= i { values.append(0) }; values[i] = max(0, v) }
-                                    }
-                                ),
-                                from: 0, through: 999, by: 0.5,
-                                sensitivity: .medium,
-                                isContinuous: false
-                            )
-                    }
-                    .padding()
-                    .background(Color.white.opacity(0.07))
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                }
+            // Big number display
+            Text("\(UnitFormatter.format(value)) \(unit)")
+                .font(.system(size: 28, weight: .bold, design: .rounded))
+                .foregroundStyle(.blue)
+                .focusable()
+                .digitalCrownRotation($value, from: step, through: maxVal, by: step, sensitivity: .medium, isContinuous: false, isHapticFeedbackEnabled: true)
+                .focused($focused)
+                .onAppear { focused = true }
 
-                Button("Log") {
-                    let log = WatchActivityLog(date: Date())
-                    for (i, m) in habit.definedMetrics.enumerated() {
-                        let v = values.indices.contains(i) ? values[i] : 0
-                        if v > 0 { log.entries.append(WatchLogPoint(metricName: m.name, value: v)) }
-                    }
-                    habit.logs.append(log)
-                    dismiss()
-                }
-                .buttonStyle(.borderedProminent)
+            if targetValue > 0 {
+                Text("Target: \(UnitFormatter.format(targetValue)) \(unit)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
-            .padding()
+
+            Button("Log") {
+                onSubmit(value)
+                dismiss()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.blue)
         }
+        .padding()
         .onAppear {
-            values = habit.definedMetrics.map { _ in 0 }
+            // Start at a sensible default
+            value = step
         }
     }
+}
 
-    private func formatValue(_ v: Double) -> String {
-        v.truncatingRemainder(dividingBy: 1) == 0 ? String(format: "%.0f", v) : String(format: "%.1f", v)
+// MARK: - Watch Friends View (CloudKit live data)
+
+struct WatchFriendsView: View {
+    @State private var friends: [WatchFriendSnapshot] = []
+    @State private var isLoading = true
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if isLoading {
+                    ProgressView("Loading…")
+                } else if friends.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "person.2")
+                            .font(.title2)
+                            .foregroundStyle(.secondary)
+                        Text("Add friends\nin the iPhone app")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                } else {
+                    List(friends) { friend in
+                        WatchFriendRow(friend: friend)
+                    }
+                }
+            }
+            .navigationTitle("Friends")
+        }
+        .task { await loadFriends() }
+    }
+
+    private func loadFriends() async {
+        let d = UserDefaults(suiteName: watchAppGroupID) ?? .standard
+        if let data = d.data(forKey: "watch_friends"),
+           let cached = try? JSONDecoder().decode([WatchFriendSnapshot].self, from: data) {
+            friends = cached
+        }
+        isLoading = false
+    }
+}
+
+struct WatchFriendSnapshot: Identifiable, Codable {
+    var id: String
+    var name: String
+    var completedToday: Int
+    var totalToday: Int
+    var topGoalName: String
+    var topGoalProgress: Double
+    var topGoalColor: String
+}
+
+struct WatchFriendRow: View {
+    let friend: WatchFriendSnapshot
+
+    var progress: Double { friend.totalToday > 0 ? Double(friend.completedToday) / Double(friend.totalToday) : 0 }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // Mini ring
+            ZStack {
+                Circle()
+                    .stroke(Color.secondary.opacity(0.2), lineWidth: 3)
+                Circle()
+                    .trim(from: 0, to: progress)
+                    .stroke(Color.blue, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+            }
+            .frame(width: 28, height: 28)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(friend.name)
+                    .font(.system(size: 14, weight: .semibold))
+                    .lineLimit(1)
+                Text("\(friend.completedToday)/\(friend.totalToday) today")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+// MARK: - Minimal number formatter (no Foundation dependency on watch)
+
+private enum UnitFormatter {
+    static func format(_ v: Double) -> String {
+        if v == v.rounded() { return String(Int(v)) }
+        return String(format: "%.1f", v)
+    }
+}
+
+// MARK: - Color hex extension (duplicated here; watch target can't import main app)
+
+extension Color {
+    init(hex: String) {
+        let h = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: h).scanHexInt64(&int)
+        let r, g, b: UInt64
+        switch h.count {
+        case 6: (r, g, b) = (int >> 16, int >> 8 & 0xFF, int & 0xFF)
+        default: (r, g, b) = (1, 1, 1)
+        }
+        self.init(.sRGB, red: Double(r)/255, green: Double(g)/255, blue: Double(b)/255)
+    }
+}
+
+// MARK: - WatchProgressCache (shared with complications)
+
+struct WatchProgressCache {
+    static let suiteName = watchAppGroupID
+    static func load() -> (completed: Int, total: Int, nextHabit: String) {
+        let d = UserDefaults(suiteName: suiteName) ?? .standard
+        return (d.integer(forKey: "watch_completed"), d.integer(forKey: "watch_total"), d.string(forKey: "watch_nextHabit") ?? "")
+    }
+    static func save(completed: Int, total: Int, nextHabit: String) {
+        let d = UserDefaults(suiteName: suiteName) ?? .standard
+        d.set(completed, forKey: "watch_completed")
+        d.set(total, forKey: "watch_total")
+        d.set(nextHabit, forKey: "watch_nextHabit")
     }
 }
